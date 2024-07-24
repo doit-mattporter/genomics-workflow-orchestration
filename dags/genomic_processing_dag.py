@@ -4,10 +4,7 @@ from airflow.providers.google.cloud.operators.compute import (
     ComputeEngineDeleteInstanceOperator,
 )
 from airflow.operators.python import BranchPythonOperator, PythonOperator
-from airflow.providers.google.cloud.sensors.gcs import (
-    GCSObjectExistenceSensor,
-    GCSObjectsWithPrefixExistenceSensor,
-)
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
 from airflow.utils.dates import days_ago
 from airflow.operators.empty import EmptyOperator
 from google.cloud import storage
@@ -52,7 +49,7 @@ def prepare_genomic_analysis_func(**context):
     reference_bucket = job_details["reference_bucket"]
     fastq_bucket = job_details["fastq_bucket"]
     fastq_file_paths = job_details["fastq_file_paths"]
-    fastq_file_paths_bash_compatible = " ".join(job_details["fastq_file_paths"])
+    fastq_file_paths_bash_list = " ".join(job_details["fastq_file_paths"])
 
     sample_ids_set = set()
     for fastq_file in fastq_file_paths:
@@ -99,10 +96,10 @@ def prepare_genomic_analysis_func(**context):
         .rstrip("-")
     )
     alignment_startup_script = f"""#!/bin/bash
-trap 'gcloud compute instances delete {alignment_instance_name} --zone=${ZONE} --quiet' ERR EXIT
+# trap 'gcloud compute instances delete {alignment_instance_name} --zone={ZONE} --quiet' ERR EXIT
 
 # Install software required to run alignment against a reference genome
-apt-get install -y python3-pip htop bzip2 bc
+apt-get install -y python3-pip htop bzip2 bc openjdk-17-jre
 python3 -m pip install google-cloud-storage --break-system-packages
 NUM_CORES=$(nproc)
 
@@ -126,6 +123,9 @@ sudo cp samtools /usr/bin/
 cd ../
 rm -f samtools-1.20.tar.bz2
 
+# Install Picard
+wget https://github.com/broadinstitute/picard/releases/download/3.2.0/picard.jar -O /usr/bin/picard.jar
+
 # Download reference genome files
 reference_blobs=$(gcloud storage ls gs://{reference_bucket}/{genome}*)
 for blob in $reference_blobs; do
@@ -133,31 +133,41 @@ for blob in $reference_blobs; do
 done
 
 # Download FASTQ files
-for fastq_file_path in {fastq_file_paths_bash_compatible}; do
+for fastq_file_path in {fastq_file_paths_bash_list}; do
     gcloud storage cp gs://{fastq_bucket}/$fastq_file_path /tmp/ &
 done
-
-wait
-
-# Align sequencing data against reference
-cd /tmp/
-genome=$(ls *.fna)
-genome_name=${{genome%.fna}}
 
 # Define a function to send each FASTQ file through alignment
 process_fastq() {{
     fastq=$1
-    sample_id=$(echo $fastq | awk -F. '{{print $4"_"$5}}')
+    tmp_unique_id=$(echo $fastq | awk -F. '{{print $4"_"$5"_"$6}}')
 
     # Construct the read group information
-    read_group="@RG\\tID:${{sample_id}}\\tSM:sample\\tPL:ILLUMINA"
+    read_group="@RG\\tID:${{tmp_unique_id}}\\tSM:sample\\tPL:ILLUMINA"
+
+    # Adjust core usage based on the number of parallel jobs being run (in order to limit 'samtools sort' memory usage)
+    NUM_JOBS=$(ls *.fastq.gz | wc -l)
+    CORES_PER_JOB=$((NUM_CORES / NUM_JOBS))
 
     # Run BWA MEM, Convert SAM to BAM, and sort the BAM
-    bwa-mem2 mem -t $NUM_CORES -R "$read_group" $genome $fastq | samtools sort -@ $NUM_CORES -m 2G -o ${{sample_id}}_${{genome_name}}.bam
+    bwa-mem2 mem -t $NUM_CORES -R "$read_group" $genome $fastq | samtools sort -@ $CORES_PER_JOB -m 2048M -o ${{tmp_unique_id}}_${{genome_name}}.bam
 
     # Index the sorted BAM file
-    samtools index ${{sample_id}}_${{genome_name}}.bam
+    samtools index ${{tmp_unique_id}}_${{genome_name}}.bam
 }}
+
+# Calculate 90% of total memory; we'll use this for the MarkDuplicates step later
+total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{{print $2}}')
+mem_for_md=$(echo "scale=2; (${{total_mem_kb}} * 0.9) / 1024 / 1024" | bc)
+rounded_mem_for_md=$(printf "%.0f" "$mem_for_md")
+
+# Wait for FASTQs and FASTA files to finish downloading
+cd /tmp/
+wait
+
+# Prepare for aligning sequencing data against reference
+genome=$(ls *.fna)
+genome_name=${{genome%.fna}}
 
 # Collect all sample IDs
 unique_sample_ids=$(for fastq in *.fastq.gz; do echo $fastq | awk -F. '{{print $4}}'; done | sort | uniq | tr '\\n' '_')
@@ -173,15 +183,21 @@ wait
 
 # Merge BAM Files
 bam_files=$(ls *_${{genome_name}}.bam | tr '\\n' ' ')
-
 samtools merge -@ $NUM_CORES -u - ${{bam_files}} | samtools sort -@ $NUM_CORES -m 3G -o merged_${{genome_name}}_${{unique_sample_ids}}.bam
 samtools index merged_${{genome_name}}_${{unique_sample_ids}}.bam
 
-gcloud storage cp merged_${{genome_name}}_${{unique_sample_ids}}.bam {results_bam_uri} &
-gcloud storage cp merged_${{genome_name}}_${{unique_sample_ids}}.bam.bai {results_bam_uri}.bai &
+# Mark duplicates
+java -Xmx${{rounded_mem_for_md}}g -jar /usr/bin/picard.jar MarkDuplicates I=merged_${{genome_name}}_${{unique_sample_ids}}.bam O=dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam M=marked_dup_metrics.txt
+samtools index dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam
+
+# Upload final BAM file to Cloud Storage
+gcloud storage cp dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam.bai {results_bam_uri}.bai &
+gcloud storage cp dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam {results_bam_uri}
+wait
 """
+    # Variant calling isn't very parallelizable and it takes ~1 day to run, so let's run it on a smaller instance
     variant_calling_startup_script = f"""#!/bin/bash
-trap 'gcloud compute instances delete {variant_calling_instance_name} --zone=${ZONE} --quiet' ERR EXIT
+# trap 'gcloud compute instances delete {variant_calling_instance_name} --zone={ZONE} --quiet' ERR EXIT
 
 # Install software required to run alignment against a reference genome
 apt-get install -y python3-pip htop docker.io bzip2 bc
@@ -337,15 +353,31 @@ start_alignment_instance = ComputeEngineInsertInstanceOperator(
     dag=dag,
 )
 
-# See if the alignment step was previously run before spinning up this expensive VM
-check_for_bam_gcs_file = GCSObjectsWithPrefixExistenceSensor(
+
+# Returns a list of objects present in a bucket with the provided prefix
+def check_gcs_prefix(bucket_name, prefix):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    return [blob.name for blob in blobs]
+
+
+# Check for BAM file in GCS
+def check_for_bam_gcs_file_func(**context):
+    bucket_name = context["task_instance"].xcom_pull(
+        task_ids="prepare_genomic_analysis", key="genome_results_bucket"
+    )
+    prefix = context["task_instance"].xcom_pull(
+        task_ids="prepare_genomic_analysis", key="results_bam_object_path"
+    )
+    return check_gcs_prefix(bucket_name, prefix)
+
+
+# Check if BAM file exists in GCS
+check_for_bam_gcs_file = PythonOperator(
     task_id="check_for_bam_gcs_file",
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    prefix="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bam_object_path') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=10,
-    poke_interval=30,
-    mode="poke",
+    python_callable=check_for_bam_gcs_file_func,
+    provide_context=True,
     dag=dag,
 )
 
@@ -378,7 +410,7 @@ wait_for_bai_gcs_file = GCSObjectExistenceSensor(
     bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
     object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bai_object_path') }}",
     google_cloud_conn_id="google_cloud_default",
-    timeout=10800,
+    timeout=28800,
     poke_interval=30,
     mode="poke",
     dag=dag,
@@ -390,7 +422,7 @@ wait_for_bam_gcs_file = GCSObjectExistenceSensor(
     bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
     object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bam_object_path') }}",
     google_cloud_conn_id="google_cloud_default",
-    timeout=10800,
+    timeout=28800,
     poke_interval=30,
     mode="poke",
     dag=dag,
@@ -405,16 +437,24 @@ terminate_alignment_instance = ComputeEngineDeleteInstanceOperator(
     dag=dag,
 )
 
-# See if the variant calling step was previously run before spinning up this long-running VM
-check_for_vcf_gvcf_gcs_files = GCSObjectsWithPrefixExistenceSensor(
+
+# Check for VCF and gVCF files in GCS
+def check_for_vcf_gvcf_gcs_files_func(**context):
+    bucket_name = context["task_instance"].xcom_pull(
+        task_ids="prepare_genomic_analysis", key="genome_results_bucket"
+    )
+    prefix = context["task_instance"].xcom_pull(
+        task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
+    )
+    return check_gcs_prefix(bucket_name, prefix)
+
+
+# Check if VCF and gVCF files exist in GCS
+check_for_vcf_gvcf_gcs_files = PythonOperator(
     task_id="check_for_vcf_gvcf_gcs_files",
+    python_callable=check_for_vcf_gvcf_gcs_files_func,
     trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    prefix="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_prefix') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=10,
-    poke_interval=30,
-    mode="poke",
+    provide_context=True,
     dag=dag,
 )
 
@@ -501,7 +541,7 @@ wait_for_vcf_gcs_file = GCSObjectExistenceSensor(
     bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
     object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_path') }}",
     google_cloud_conn_id="google_cloud_default",
-    timeout=259200,
+    timeout=172800,
     poke_interval=120,
     mode="poke",
     dag=dag,
@@ -513,7 +553,7 @@ wait_for_gvcf_gcs_file = GCSObjectExistenceSensor(
     bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
     object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_gvcf_object_path') }}",
     google_cloud_conn_id="google_cloud_default",
-    timeout=259200,
+    timeout=172800,
     poke_interval=120,
     mode="poke",
     dag=dag,
