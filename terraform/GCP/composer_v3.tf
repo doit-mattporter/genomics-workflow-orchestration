@@ -1,5 +1,5 @@
 resource "google_composer_environment" "genomics_composer_v3" {
-  name   = "my-composer-env"
+  name   = "cat-composer-env"
   region = local.env_configs[terraform.workspace].region
 
   config {

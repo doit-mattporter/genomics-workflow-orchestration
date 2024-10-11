@@ -25,7 +25,7 @@ def make_composer2_web_server_request(url, method="GET", **kwargs):
 
 
 def trigger_dag(dag_id, job_details):
-    """Make a request to trigger a DAG using the stable Airflow REST API."""
+    """Make a request to trigger a DAG using the Airflow REST API."""
     endpoint = f"api/v1/dags/{dag_id}/dagRuns"
     request_url = f"{AIRFLOW_WEB_SERVER_URL}/{endpoint}"
     json_data = {"conf": job_details}

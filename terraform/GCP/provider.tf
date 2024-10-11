@@ -12,7 +12,7 @@ terraform {
     }
     random = {
       source  = "hashicorp/random"
-      version = "~> 3.6.1"
+      version = "~> 3.6.3"
     }
     archive = {
       source  = "hashicorp/archive"
@@ -20,11 +20,11 @@ terraform {
     }
     external = {
       source  = "hashicorp/external"
-      version = "~> 2.3.3"
+      version = "~> 2.3.4"
     }
     null = {
       source = "hashicorp/null"
-      version = "~> 3.2.2"
+      version = "~> 3.2.3"
     }
   }
 }
