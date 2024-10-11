@@ -6,6 +6,7 @@ from airflow.providers.google.cloud.operators.compute import (
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
 from airflow.utils.dates import days_ago
+from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
 from google.cloud import storage
 from math import ceil
@@ -28,7 +29,7 @@ default_args = {"owner": "airflow", "start_date": days_ago(1), "retries": 0}
 dag = DAG(
     "genomic_processing_dag",
     default_args=default_args,
-    description="A DAG to process cat genomic data. The Pub/Sub messages that kick this off are generated when sequencing objects are uploaded to the data source bucket.",
+    description="A DAG to process cat genomic sequencing data. The Cloud Function message that kicks this off is generated when sequencing objects are uploaded to the data source bucket and an accompanying 'ready.txt' file listing all the FASTQ GCS URIs for a sample is uploaded to the same location.",
     schedule_interval=None,
     catchup=False,
 )
@@ -313,54 +314,6 @@ prepare_genomic_analysis = PythonOperator(
     dag=dag,
 )
 
-# Start running alignment of FASTQs against the reference genome
-start_alignment_instance = ComputeEngineInsertInstanceOperator(
-    task_id="start_alignment_instance",
-    trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
-    project_id=PROJECT_ID,
-    zone=ZONE,
-    body={
-        "name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
-        "machine_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_machine_type') }}",
-        "disks": [
-            {
-                "boot": True,
-                "auto_delete": True,
-                "device_name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
-                "initialize_params": {
-                    "disk_size_gb": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_size_gb') | int }}",
-                    "disk_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_type') }}",
-                    "source_image": "projects/debian-cloud/global/images/family/debian-12",
-                },
-            }
-        ],
-        "metadata": {
-            "items": [
-                {
-                    "key": "startup-script",
-                    "value": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_startup_script') }}",
-                }
-            ]
-        },
-        "network_interfaces": [
-            {
-                "network": "global/networks/default",
-                "subnetwork": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='subnetwork') }}",
-                "nic_type": "GVNIC",
-                "stack_type": "IPV4_ONLY",
-                "access_configs": [{"name": "External NAT", "network_tier": "PREMIUM"}],
-            }
-        ],
-        "service_accounts": [
-            {
-                "email": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='sa_email') }}",
-                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
-            }
-        ],
-    },
-    dag=dag,
-)
-
 
 # Returns a list of objects present in a bucket with the provided prefix
 def check_gcs_prefix(bucket_name, prefix):
@@ -370,240 +323,288 @@ def check_gcs_prefix(bucket_name, prefix):
     return [blob.name for blob in blobs]
 
 
-# Check if BAM file exists in GCS
-def check_for_bam_gcs_file_func(**context):
-    bucket_name = context["task_instance"].xcom_pull(
-        task_ids="prepare_genomic_analysis", key="genome_results_bucket"
-    )
-    prefix = context["task_instance"].xcom_pull(
-        task_ids="prepare_genomic_analysis", key="results_bam_object_path"
-    )
-    return check_gcs_prefix(bucket_name, prefix)
-
-
-# Check if BAM file exists in GCS
-check_for_bam_gcs_file = PythonOperator(
-    task_id="check_for_bam_gcs_file",
-    python_callable=check_for_bam_gcs_file_func,
-    provide_context=True,
-    dag=dag,
-)
-
-
-# Determine the DAG branch to take based on whether a BAM file is present in GCS
-def bam_bai_present_branch_func(**context):
-    bam_file_present = context["task_instance"].xcom_pull(
-        task_ids="check_for_bam_gcs_file", key="return_value"
-    )
-    if len(bam_file_present) >= 2:
-        return "bam_bai_present"
-    else:
-        return "bam_bai_not_present"
-
-
-# Skip the alignment step and go straight to variant calling if the BAM is already present from a previous alignment run
-bam_bai_present_branch = BranchPythonOperator(
-    task_id="bam_bai_present_branch",
-    python_callable=bam_bai_present_branch_func,
-    dag=dag,
-)
-
-bam_bai_present = EmptyOperator(task_id="bam_bai_present", dag=dag)
-
-bam_bai_not_present = EmptyOperator(task_id="bam_bai_not_present", dag=dag)
-
-# Wait for alignment of FASTQs against the reference genome to complete by monitoring for a BAI file in GCS
-wait_for_bai_gcs_file = GCSObjectExistenceSensor(
-    task_id="wait_for_bai_gcs_file",
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bai_object_path') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=28800,
-    poke_interval=30,
-    mode="poke",
-    dag=dag,
-)
-
-# Wait for alignment of FASTQs against the reference genome to complete by monitoring for a BAM file in GCS
-wait_for_bam_gcs_file = GCSObjectExistenceSensor(
-    task_id="wait_for_bam_gcs_file",
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bam_object_path') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=28800,
-    poke_interval=30,
-    mode="poke",
-    dag=dag,
-)
-
-# Since we perform alignment with high cost compute machines, even though they should self-terminate we want to be sure they are terminated by the time the output files are in GCS
-terminate_alignment_instance = ComputeEngineDeleteInstanceOperator(
-    task_id="terminate_alignment_instance",
-    project_id=PROJECT_ID,
-    zone=ZONE,
-    resource_id="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
-    dag=dag,
-)
-
-
-# Check for VCF and gVCF files in GCS
-def check_for_vcf_gvcf_gcs_files_func(**context):
-    bucket_name = context["task_instance"].xcom_pull(
-        task_ids="prepare_genomic_analysis", key="genome_results_bucket"
-    )
-    prefix = context["task_instance"].xcom_pull(
-        task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
-    )
-    return check_gcs_prefix(bucket_name, prefix)
-
-
-# Check if VCF and gVCF files exist in GCS
-check_for_vcf_gvcf_gcs_files = PythonOperator(
-    task_id="check_for_vcf_gvcf_gcs_files",
-    python_callable=check_for_vcf_gvcf_gcs_files_func,
-    trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
-    provide_context=True,
-    dag=dag,
-)
-
-
-# Determine the DAG branch to take based on whether VCF files are present in GCS
-def vcf_gvcf_present_branch_func(**context):
-    vcf_gvcf_prefix = context["task_instance"].xcom_pull(
-        task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
-    )
-    prefix_files = context["task_instance"].xcom_pull(
-        task_ids="check_for_vcf_gvcf_gcs_files", key="return_value"
-    )
-    if (
-        f"{vcf_gvcf_prefix}.vcf.gz" in prefix_files
-        and f"{vcf_gvcf_prefix}.g.vcf.gz" in prefix_files
-    ):
-        return "vcf_gvcf_present"
-    else:
-        return "vcf_gvcf_not_present"
-
-
-# Skip the variant calling step if the VCF and gVCF are already present from a previous run
-vcf_gvcf_present_branch = BranchPythonOperator(
-    task_id="vcf_gvcf_present_branch",
-    python_callable=vcf_gvcf_present_branch_func,
-    dag=dag,
-)
-
-vcf_gvcf_present = EmptyOperator(task_id="vcf_gvcf_present", dag=dag)
-
-vcf_gvcf_not_present = EmptyOperator(task_id="vcf_gvcf_not_present", dag=dag)
-
-# Start variant calling after alignment has finished
-start_variant_calling_instance = ComputeEngineInsertInstanceOperator(
-    task_id="start_variant_calling_instance",
-    trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
-    project_id=PROJECT_ID,
-    zone=ZONE,
-    body={
-        "name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
-        "machine_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_machine_type') }}",
-        "disks": [
-            {
-                "boot": True,
-                "auto_delete": True,
-                "device_name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
-                "initialize_params": {
-                    "disk_size_gb": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_size_gb') | int }}",
-                    "disk_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_type') }}",
-                    "source_image": "projects/debian-cloud/global/images/family/debian-12",
-                },
-            }
-        ],
-        "metadata": {
-            "items": [
+with TaskGroup(group_id="alignment_tasks", dag=dag) as alignment_tasks:
+    # Start running alignment of FASTQs against the reference genome
+    start_alignment_instance = ComputeEngineInsertInstanceOperator(
+        task_id="start_alignment_instance",
+        trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        body={
+            "name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
+            "machine_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_machine_type') }}",
+            "disks": [
                 {
-                    "key": "startup-script",
-                    "value": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_startup_script') }}",
+                    "boot": True,
+                    "auto_delete": True,
+                    "device_name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
+                    "initialize_params": {
+                        "disk_size_gb": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_size_gb') | int }}",
+                        "disk_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_type') }}",
+                        "source_image": "projects/debian-cloud/global/images/family/debian-12",
+                    },
                 }
-            ]
+            ],
+            "metadata": {
+                "items": [
+                    {
+                        "key": "startup-script",
+                        "value": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_startup_script') }}",
+                    }
+                ]
+            },
+            "network_interfaces": [
+                {
+                    "network": "global/networks/default",
+                    "subnetwork": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='subnetwork') }}",
+                    "nic_type": "GVNIC",
+                    "stack_type": "IPV4_ONLY",
+                    "access_configs": [
+                        {"name": "External NAT", "network_tier": "PREMIUM"}
+                    ],
+                }
+            ],
+            "service_accounts": [
+                {
+                    "email": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='sa_email') }}",
+                    "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                }
+            ],
         },
-        "network_interfaces": [
-            {
-                "network": "global/networks/default",
-                "subnetwork": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='subnetwork') }}",
-                "nic_type": "GVNIC",
-                "stack_type": "IPV4_ONLY",
-                "access_configs": [{"name": "External NAT", "network_tier": "PREMIUM"}],
-            }
-        ],
-        "service_accounts": [
-            {
-                "email": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='sa_email') }}",
-                "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
-            }
-        ],
-    },
-    dag=dag,
-)
+        dag=dag,
+    )
 
-# Check for successful variant calling completion by monitoring for a VCF file in GCS
-wait_for_vcf_gcs_file = GCSObjectExistenceSensor(
-    task_id="wait_for_vcf_gcs_file",
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_path') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=172800,
-    poke_interval=120,
-    mode="poke",
-    dag=dag,
-)
+    # Check if BAM file exists in GCS
+    def check_for_bam_gcs_file_func(**context):
+        bucket_name = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="genome_results_bucket"
+        )
+        prefix = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="results_bam_object_path"
+        )
+        return check_gcs_prefix(bucket_name, prefix)
 
-# Check for successful variant calling completion by monitoring for a gVCF file in GCS
-wait_for_gvcf_gcs_file = GCSObjectExistenceSensor(
-    task_id="wait_for_gvcf_gcs_file",
-    bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
-    object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_gvcf_object_path') }}",
-    google_cloud_conn_id="google_cloud_default",
-    timeout=172800,
-    poke_interval=120,
-    mode="poke",
-    dag=dag,
-)
+    # Check if BAM file exists in GCS
+    check_for_bam_gcs_file = PythonOperator(
+        task_id="check_for_bam_gcs_file",
+        python_callable=check_for_bam_gcs_file_func,
+        provide_context=True,
+        dag=dag,
+    )
 
-# Since we perform VC with long-running machines, even though they should self-terminate we want to be sure they are terminated by the time the output files are in GCS
-terminate_variant_calling_instance = ComputeEngineDeleteInstanceOperator(
-    task_id="terminate_variant_calling_instance",
-    project_id=PROJECT_ID,
-    zone=ZONE,
-    resource_id="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
-    dag=dag,
-)
+    # Determine the DAG branch to take based on whether a BAM file is present in GCS
+    def bam_bai_present_branch_func(**context):
+        files_present = context["task_instance"].xcom_pull(
+            task_ids="alignment_tasks.check_for_bam_gcs_file", key="return_value"
+        )
+        print(files_present)
+        bam_present = any(file.endswith(".bam") for file in files_present)
+        bai_present = any(file.endswith(".bai") for file in files_present)
+        if bam_present and bai_present:
+            return "alignment_tasks.bam_bai_present"
+        else:
+            return "alignment_tasks.bam_bai_not_present"
+
+    # Skip the alignment step and go straight to variant calling if the BAM is already present from a previous alignment run
+    bam_bai_present_branch = BranchPythonOperator(
+        task_id="bam_bai_present_branch",
+        python_callable=bam_bai_present_branch_func,
+        dag=dag,
+    )
+
+    bam_bai_present = EmptyOperator(task_id="bam_bai_present", dag=dag)
+
+    bam_bai_not_present = EmptyOperator(task_id="bam_bai_not_present", dag=dag)
+
+    # Wait for alignment of FASTQs against the reference genome to complete by monitoring for a BAI file in GCS
+    wait_for_bai_gcs_file = GCSObjectExistenceSensor(
+        task_id="wait_for_bai_gcs_file",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bai_object_path') }}",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=28800,
+        poke_interval=30,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Wait for alignment of FASTQs against the reference genome to complete by monitoring for a BAM file in GCS
+    wait_for_bam_gcs_file = GCSObjectExistenceSensor(
+        task_id="wait_for_bam_gcs_file",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_bam_object_path') }}",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=28800,
+        poke_interval=30,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Since we perform alignment with high cost compute machines, even though they should self-terminate we want to be sure they are terminated by the time the output files are in GCS
+    terminate_alignment_instance = ComputeEngineDeleteInstanceOperator(
+        task_id="terminate_alignment_instance",
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        resource_id="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='alignment_instance_name') }}",
+        dag=dag,
+    )
+
+    (
+        check_for_bam_gcs_file
+        >> bam_bai_present_branch
+        >> [bam_bai_present, bam_bai_not_present]
+    )
+    (
+        bam_bai_not_present
+        >> start_alignment_instance
+        >> wait_for_bam_gcs_file
+        >> wait_for_bai_gcs_file
+        >> terminate_alignment_instance
+    )
+
+
+with TaskGroup(group_id="variant_calling_tasks", dag=dag) as variant_calling_tasks:
+    # Check for VCF and gVCF files in GCS
+    def check_for_vcf_gvcf_gcs_files_func(**context):
+        bucket_name = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="genome_results_bucket"
+        )
+        prefix = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
+        )
+        return check_gcs_prefix(bucket_name, prefix)
+
+    # Check if VCF and gVCF files exist in GCS
+    check_for_vcf_gvcf_gcs_files = PythonOperator(
+        task_id="check_for_vcf_gvcf_gcs_files",
+        python_callable=check_for_vcf_gvcf_gcs_files_func,
+        trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
+        provide_context=True,
+        dag=dag,
+    )
+
+    # Determine the DAG branch to take based on whether VCF files are present in GCS
+    def vcf_gvcf_present_branch_func(**context):
+        vcf_gvcf_prefix = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
+        )
+        prefix_files = context["task_instance"].xcom_pull(
+            task_ids="variant_calling_tasks.check_for_vcf_gvcf_gcs_files", key="return_value"
+        )
+        if (
+            f"{vcf_gvcf_prefix}.vcf.gz" in prefix_files
+            and f"{vcf_gvcf_prefix}.g.vcf.gz" in prefix_files
+        ):
+            return "variant_calling_tasks.vcf_gvcf_present"
+        else:
+            return "variant_calling_tasks.vcf_gvcf_not_present"
+
+    # Skip the variant calling step if the VCF and gVCF are already present from a previous run
+    vcf_gvcf_present_branch = BranchPythonOperator(
+        task_id="vcf_gvcf_present_branch",
+        python_callable=vcf_gvcf_present_branch_func,
+        dag=dag,
+    )
+
+    vcf_gvcf_present = EmptyOperator(task_id="vcf_gvcf_present", dag=dag)
+
+    vcf_gvcf_not_present = EmptyOperator(task_id="vcf_gvcf_not_present", dag=dag)
+
+    # Start variant calling after alignment has finished
+    start_variant_calling_instance = ComputeEngineInsertInstanceOperator(
+        task_id="start_variant_calling_instance",
+        trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        body={
+            "name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
+            "machine_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_machine_type') }}",
+            "disks": [
+                {
+                    "boot": True,
+                    "auto_delete": True,
+                    "device_name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
+                    "initialize_params": {
+                        "disk_size_gb": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_size_gb') | int }}",
+                        "disk_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_type') }}",
+                        "source_image": "projects/debian-cloud/global/images/family/debian-12",
+                    },
+                }
+            ],
+            "metadata": {
+                "items": [
+                    {
+                        "key": "startup-script",
+                        "value": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_startup_script') }}",
+                    }
+                ]
+            },
+            "network_interfaces": [
+                {
+                    "network": "global/networks/default",
+                    "subnetwork": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='subnetwork') }}",
+                    "nic_type": "GVNIC",
+                    "stack_type": "IPV4_ONLY",
+                    "access_configs": [
+                        {"name": "External NAT", "network_tier": "PREMIUM"}
+                    ],
+                }
+            ],
+            "service_accounts": [
+                {
+                    "email": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='sa_email') }}",
+                    "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                }
+            ],
+        },
+        dag=dag,
+    )
+
+    # Check for successful variant calling completion by monitoring for a VCF file in GCS
+    wait_for_vcf_gcs_file = GCSObjectExistenceSensor(
+        task_id="wait_for_vcf_gcs_file",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_path') }}",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=172800,
+        poke_interval=120,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Check for successful variant calling completion by monitoring for a gVCF file in GCS
+    wait_for_gvcf_gcs_file = GCSObjectExistenceSensor(
+        task_id="wait_for_gvcf_gcs_file",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_gvcf_object_path') }}",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=172800,
+        poke_interval=120,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Since we perform VC with long-running machines, even though they should self-terminate we want to be sure they are terminated by the time the output files are in GCS
+    terminate_variant_calling_instance = ComputeEngineDeleteInstanceOperator(
+        task_id="terminate_variant_calling_instance",
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        resource_id="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='variant_calling_instance_name') }}",
+        dag=dag,
+    )
+
+    (
+        check_for_vcf_gvcf_gcs_files
+        >> vcf_gvcf_present_branch
+        >> [vcf_gvcf_present, vcf_gvcf_not_present]
+    )
+    (
+        vcf_gvcf_not_present
+        >> start_variant_calling_instance
+        >> wait_for_vcf_gcs_file
+        >> wait_for_gvcf_gcs_file
+        >> terminate_variant_calling_instance
+    )
 
 # Define DAG task dependencies
-(prepare_genomic_analysis >> check_for_bam_gcs_file >> bam_bai_present_branch)
-
-(
-    bam_bai_present_branch
-    >> bam_bai_present
-    >> check_for_vcf_gvcf_gcs_files
-    >> vcf_gvcf_present_branch
-)
-
-(
-    bam_bai_present_branch
-    >> bam_bai_not_present
-    >> start_alignment_instance
-    >> wait_for_bam_gcs_file
-    >> wait_for_bai_gcs_file
-    >> terminate_alignment_instance
-    >> check_for_vcf_gvcf_gcs_files
-    >> vcf_gvcf_present_branch
-)
-
-vcf_gvcf_present_branch >> vcf_gvcf_present
-
-(
-    vcf_gvcf_present_branch
-    >> vcf_gvcf_not_present
-    >> start_variant_calling_instance
-    >> wait_for_vcf_gcs_file
-    >> wait_for_gvcf_gcs_file
-    >> terminate_variant_calling_instance
-)
+prepare_genomic_analysis >> alignment_tasks >> variant_calling_tasks
