@@ -98,6 +98,10 @@ def prepare_genomic_analysis_func(**context):
     alignment_startup_script = f"""#!/bin/bash
 # trap 'gcloud compute instances delete {alignment_instance_name} --zone={ZONE} --quiet' ERR EXIT
 
+# Install the Ops Agent to enable memory utilization monitoring
+curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+
 # Install software required to run alignment against a reference genome
 apt-get install -y python3-pip htop bzip2 bc openjdk-17-jre
 python3 -m pip install google-cloud-storage --break-system-packages
@@ -195,11 +199,15 @@ gcloud storage cp dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam.bai {
 gcloud storage cp dedup_merged_${{genome_name}}_${{unique_sample_ids}}.bam {results_bam_uri}
 wait
 """
-    # Variant calling isn't very parallelizable and it takes ~1 day to run, so let's run it on a smaller instance
+    # Variant calling isn't very parallelizable and takes up to a day to run, so let's run it on a smaller instance
     variant_calling_startup_script = f"""#!/bin/bash
 # trap 'gcloud compute instances delete {variant_calling_instance_name} --zone={ZONE} --quiet' ERR EXIT
 
-# Install software required to run alignment against a reference genome
+# Install the Ops Agent to enable memory utilization monitoring
+curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+
+# Install software required to run variant calling
 apt-get install -y python3-pip htop docker.io bzip2 bc
 python3 -m pip install google-cloud-storage --break-system-packages
 sudo usermod -aG docker $USER
@@ -232,14 +240,14 @@ mem_for_gatk=$(echo "scale=2; ((${{total_mem_kb}} * 0.9) / 2) / 1024 / 1024" | b
 rounded_mem_for_gatk=$(printf "%.0f" "$mem_for_gatk")
 
 # Perform variant calling with GATK
-docker run --rm -v /tmp/:/data broadinstitute/gatk:latest \\
+docker run -v /tmp/:/data broadinstitute/gatk:latest \\
     gatk --java-options "-Xmx${{rounded_mem_for_gatk}}G" HaplotypeCaller \\
     -R /data/${{genome}} \\
     -I /data/{results_bam_filename} \\
     -O /data/{results_vcf_filename} && gcloud storage cp /tmp/{results_vcf_filename} {results_vcf_uri} &
 
 # Also create a gVCF
-docker run --rm -v /tmp/:/data broadinstitute/gatk:latest \\
+docker run -v /tmp/:/data broadinstitute/gatk:latest \\
     gatk --java-options "-Xmx${{rounded_mem_for_gatk}}G" HaplotypeCaller \\
     -R /data/${{genome}} \\
     -I /data/{results_bam_filename} \\
@@ -362,7 +370,7 @@ def check_gcs_prefix(bucket_name, prefix):
     return [blob.name for blob in blobs]
 
 
-# Check for BAM file in GCS
+# Check if BAM file exists in GCS
 def check_for_bam_gcs_file_func(**context):
     bucket_name = context["task_instance"].xcom_pull(
         task_ids="prepare_genomic_analysis", key="genome_results_bucket"
