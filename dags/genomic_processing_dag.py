@@ -67,11 +67,27 @@ def prepare_genomic_analysis_func(**context):
     results_vcf_uri = f"gs://{GENOMICS_OUTPUT_BUCKET}/{sample_ids}_{genome}.vcf.gz"
     results_gvcf_filename = f"{sample_ids}_{genome}.g.vcf.gz"
     results_gvcf_uri = f"gs://{GENOMICS_OUTPUT_BUCKET}/{sample_ids}_{genome}.g.vcf.gz"
+    results_ann_vcf_filename = f"{sample_ids}_{genome}_snpeff.ann.vcf.gz"
+    results_ann_vcf_uri = (
+        f"gs://{GENOMICS_OUTPUT_BUCKET}/{sample_ids}_{genome}_snpeff.ann.vcf.gz"
+    )
+    results_ann_tsv_filename = f"{sample_ids}_{genome}_snpeff.ann.tsv.gz"
+    results_ann_tsv_uri = (
+        f"gs://{GENOMICS_OUTPUT_BUCKET}/{sample_ids}_{genome}_snpeff.ann.tsv.gz"
+    )
     results_bam_object_path = f"{sample_ids}_{genome}.bam"
     results_bai_object_path = f"{sample_ids}_{genome}.bam.bai"
     results_vcf_object_path = f"{sample_ids}_{genome}.vcf.gz"
     results_gvcf_object_path = f"{sample_ids}_{genome}.g.vcf.gz"
+    results_ann_vcf_object_path = f"{sample_ids}_{genome}.ann.vcf.gz"
+    results_ann_tsv_object_path = f"{sample_ids}_{genome}.ann.tsv.gz"
     results_vcf_object_prefix = f"{sample_ids}_{genome}"
+
+    # Add a check for the reference genome - only 9.0 analyses can run tertiary analysis (annotation)
+    is_felis_catus_9_0 = "felis_catus_9.0" in genome.lower()
+    context["task_instance"].xcom_push(
+        key="is_felis_catus_9_0", value=is_felis_catus_9_0
+    )
 
     # Fetch the size of the FASTQ files in order to size the disk to 12X their total size
     storage_client = storage.Client()
@@ -93,6 +109,11 @@ def prepare_genomic_analysis_func(**context):
     )
     variant_calling_instance_name = (
         f"vc{random_uuid}-sample{sample_ids_sanitized}-{genome_sanitized}"[:62]
+        .lower()
+        .rstrip("-")
+    )
+    annotation_instance_name = (
+        f"an{random_uuid}-sample{sample_ids_sanitized}-{genome_sanitized}"[:62]
         .lower()
         .rstrip("-")
     )
@@ -257,6 +278,95 @@ docker run -v /tmp/:/data broadinstitute/gatk:latest \\
 
 wait
 """
+    annotation_startup_script = f"""#!/usr/bin/env bash
+# Install software required to run snpEff
+apt-get update && apt-get install -y python3-pip gcc make libbz2-dev liblzma-dev libcurl4-openssl-dev pigz unzip htop
+
+mkdir -p $HOME/felis_catus_9.0/output/
+gcloud storage cp {results_vcf_uri} $HOME/felis_catus_9.0/ &
+
+# Install bcftools
+wget https://github.com/samtools/bcftools/releases/download/1.20/bcftools-1.20.tar.bz2
+tar -xvjf bcftools-1.20.tar.bz2
+cd bcftools-1.20
+make
+make install
+cd ../
+
+# Install bgzip and tabix
+wget https://github.com/samtools/htslib/releases/download/1.20/htslib-1.20.tar.bz2
+tar -xvjf htslib-1.20.tar.bz2
+cd htslib-1.20
+make
+make install
+cd ../
+
+# Download Java 21
+wget https://download.oracle.com/java/21/latest/jdk-21_linux-x64_bin.deb
+dpkg -i jdk-21_linux-x64_bin.deb &
+
+# Download SnpEff
+wget -P /snpEff/ https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip
+unzip /snpEff/snpEff_latest_core.zip
+rm -f /snpEff/snpEff_latest_core.zip
+
+# Convert the chromosome names in the VCF to be SnpEff compatible
+cat <<EOL > chromosome_mapping.txt
+NC_018723.3    A1
+NC_018724.3    A2
+NC_018725.3    A3
+NC_018726.3    B1
+NC_018727.3    B2
+NC_018728.3    B3
+NC_018729.3    B4
+NC_018730.3    C1
+NC_018731.3    C2
+NC_018732.3    D1
+NC_018733.3    D2
+NC_018734.3    D3
+NC_018735.3    D4
+NC_018736.3    E1
+NC_018737.3    E2
+NC_018738.3    E3
+NC_018739.3    F1
+NC_018740.3    F2
+NC_018741.3    X
+EOL
+
+wait
+
+# Download Felis Catus 9.0
+java -jar /snpEff/snpEff.jar download Felis_catus_9.0.99 &
+
+# Split multi-allelic variants into separate lines
+bcftools norm -m -both -o $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_split.vcf.gz')} -O z $HOME/felis_catus_9.0/{results_vcf_filename}
+
+# Rename chromosomes to be compatible with SnpEff's Felis catus 9.0 database
+bcftools annotate --rename-chrs chromosome_mapping.txt -o $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_renamed.vcf.gz')} $HOME/felis_catus_9.0/{results_vcf_filename}
+tabix -p vcf $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_renamed.vcf.gz')}
+bcftools view -r A1,A2,A3,B1,B2,B3,B4,C1,C2,D1,D2,D3,D4,E1,E2,E3,F1,F2,X -o $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_snpeffready.vcf.gz')} -O z $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_renamed.vcf.gz')}
+wait
+
+# Run SnpEff
+java -Xmx8g -jar /snpEff/snpEff.jar Felis_catus_9.0.99 $HOME/felis_catus_9.0/{results_vcf_filename.replace('.vcf.gz', '_snpeffready.vcf.gz')} > $HOME/felis_catus_9.0/output/{results_vcf_filename.replace('.vcf.gz', '_snpeff.ann.vcf')}
+bgzip $HOME/felis_catus_9.0/output/{results_vcf_filename.replace('.vcf.gz', '_snpeff.ann.vcf')}
+tabix -p vcf $HOME/felis_catus_9.0/output/{results_ann_vcf_filename}
+gcloud storage cp $HOME/felis_catus_9.0/output/{results_ann_vcf_filename} {results_ann_vcf_uri} &
+gcloud storage cp $HOME/felis_catus_9.0/output/{results_ann_vcf_filename}.tbi {results_ann_vcf_uri}.tbi &
+
+# Print the VCF headers with the ANN field headers
+ANN_HEADERS="Allele\tAnnotation\tAnnotation_Impact\tGene_Name\tGene_ID\tFeature_Type\tFeature_ID\tTranscript_BioType\tRank\tHGVS.c\tHGVS.p\tcDNA.pos/cDNA.length\tCDS.pos/CDS.length\tAA.pos/AA.length\tDistance\tERRORS/WARNINGS/INFO"
+bcftools view -h $HOME/felis_catus_9.0/output/{results_ann_vcf_filename} | grep -v "^##" | \
+    awk -v ann_headers="$ANN_HEADERS" 'BEGIN {{OFS="\t"}} {{if($1 == "#CHROM") {{print $1, $2, $3, $4, $5, $6, $7, ann_headers}} else {{print}}}}' > $HOME/felis_catus_9.0/output/{results_vcf_filename.replace('.vcf.gz', '_snpeff.ann.tsv')}
+
+# Process the VCF to TSV with split ANN fields
+bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/ANN\n' $HOME/felis_catus_9.0/output/{results_ann_vcf_filename} | \
+    awk 'BEGIN {{OFS="\t"}} {{split($8, a, "|"); print $1, $2, $3, $4, $5, $6, $7, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16]}}' >> $HOME/felis_catus_9.0/output/{results_vcf_filename.replace('.vcf.gz', '_snpeff.ann.tsv')}
+
+pigz -9 $HOME/felis_catus_9.0/output/{results_vcf_filename.replace('.vcf.gz', '_snpeff.ann.tsv')}
+gcloud storage cp $HOME/felis_catus_9.0/output/{results_ann_tsv_filename} {results_ann_tsv_uri}
+wait
+"""
     # Send to XCom the details required to spin up genomic analysis instances and monitor GCS for their outputs
     context["task_instance"].xcom_push(
         key="genome_results_bucket", value=GENOMICS_OUTPUT_BUCKET
@@ -274,6 +384,12 @@ wait
         key="results_gvcf_object_path", value=results_gvcf_object_path
     )
     context["task_instance"].xcom_push(
+        key="results_ann_vcf_object_path", value=results_ann_vcf_object_path
+    )
+    context["task_instance"].xcom_push(
+        key="results_ann_tsv_object_path", value=results_ann_tsv_object_path
+    )
+    context["task_instance"].xcom_push(
         key="results_vcf_object_prefix", value=results_vcf_object_prefix
     )
     context["task_instance"].xcom_push(
@@ -283,11 +399,17 @@ wait
         key="variant_calling_instance_name", value=variant_calling_instance_name
     )
     context["task_instance"].xcom_push(
+        key="annotation_instance_name", value=annotation_instance_name
+    )
+    context["task_instance"].xcom_push(
         key="alignment_machine_type", value=f"zones/{ZONE}/machineTypes/c3-standard-88"
     )
     context["task_instance"].xcom_push(
         key="variant_calling_machine_type",
         value=f"zones/{ZONE}/machineTypes/c3-standard-8",
+    )
+    context["task_instance"].xcom_push(
+        key="annotation_machine_type", value=f"zones/{ZONE}/machineTypes/c3-standard-8"
     )
     context["task_instance"].xcom_push(
         key="subnetwork", value=f"regions/{REGION}/subnetworks/default"
@@ -301,6 +423,9 @@ wait
     )
     context["task_instance"].xcom_push(
         key="variant_calling_startup_script", value=variant_calling_startup_script
+    )
+    context["task_instance"].xcom_push(
+        key="annotation_startup_script", value=annotation_startup_script
     )
     context["task_instance"].xcom_push(
         key="sa_email", value=f"{PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
@@ -489,7 +614,8 @@ with TaskGroup(group_id="variant_calling_tasks", dag=dag) as variant_calling_tas
             task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
         )
         prefix_files = context["task_instance"].xcom_pull(
-            task_ids="variant_calling_tasks.check_for_vcf_gvcf_gcs_files", key="return_value"
+            task_ids="variant_calling_tasks.check_for_vcf_gvcf_gcs_files",
+            key="return_value",
         )
         if (
             f"{vcf_gvcf_prefix}.vcf.gz" in prefix_files
@@ -606,5 +732,209 @@ with TaskGroup(group_id="variant_calling_tasks", dag=dag) as variant_calling_tas
         >> terminate_variant_calling_instance
     )
 
+
+with TaskGroup(group_id="annotation_tasks", dag=dag) as annotation_tasks:
+
+    def check_reference_genome_func(**context):
+        is_felis_catus_9_0 = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="is_felis_catus_9_0"
+        )
+        return is_felis_catus_9_0
+
+    # Check if Felis Catus 9.0 is being used
+    check_for_reference_genome = PythonOperator(
+        task_id="check_for_reference_genome",
+        python_callable=check_reference_genome_func,
+        trigger_rule="none_failed_min_one_success",  # Allows for upstream branching DAG logic
+        provide_context=True,
+        dag=dag,
+    )
+
+    def check_reference_genome_branch_func(**context):
+        is_felis_catus_9_0 = context["task_instance"].xcom_pull(
+            task_ids="annotation_tasks.check_for_reference_genome", key="return_value"
+        )
+        if is_felis_catus_9_0:
+            return "annotation_tasks.check_for_annotated_vcf_tsv_files"
+        else:
+            return "annotation_tasks.skip_annotation"
+
+    check_reference_genome_branch = BranchPythonOperator(
+        task_id="check_reference_genome_branch",
+        python_callable=check_reference_genome_branch_func,
+        dag=dag,
+    )
+
+    skip_annotation = EmptyOperator(task_id="skip_annotation", dag=dag)
+
+    def check_for_annotated_vcf_tsv_files_func(**context):
+        bucket_name = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="genome_results_bucket"
+        )
+        vcf_prefix = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
+        )
+
+        expected_files = [
+            f"{vcf_prefix}_snpeff.ann.vcf.gz",
+            f"{vcf_prefix}_snpeff.ann.vcf.gz.tbi",
+            f"{vcf_prefix}_snpeff.ann.tsv.gz",
+        ]
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+
+        files_present = []
+        for file_name in expected_files:
+            blob = bucket.blob(file_name)
+            if blob.exists():
+                files_present.append(file_name)
+
+        return files_present
+
+    check_for_annotated_vcf_tsv_files = PythonOperator(
+        task_id="check_for_annotated_vcf_tsv_files",
+        python_callable=check_for_annotated_vcf_tsv_files_func,
+        trigger_rule="none_failed_min_one_success",
+        provide_context=True,
+        dag=dag,
+    )
+
+    # Determine the DAG branch based on whether annotated files are present in GCS
+    def annotated_vcf_tsv_present_branch_func(**context):
+        vcf_prefix = context["task_instance"].xcom_pull(
+            task_ids="prepare_genomic_analysis", key="results_vcf_object_prefix"
+        )
+        files_present = context["task_instance"].xcom_pull(
+            task_ids="annotation_tasks.check_for_annotated_vcf_tsv_files",
+            key="return_value",
+        )
+        required_files = [
+            f"{vcf_prefix}_snpeff.ann.vcf.gz",
+            f"{vcf_prefix}_snpeff.ann.vcf.gz.tbi",
+            f"{vcf_prefix}_snpeff.ann.tsv.gz",
+        ]
+        if all(file in files_present for file in required_files):
+            return "annotation_tasks.annotated_vcf_tsv_present"
+        else:
+            return "annotation_tasks.annotated_vcf_tsv_not_present"
+
+    annotated_vcf_tsv_present_branch = BranchPythonOperator(
+        task_id="annotated_vcf_tsv_present_branch",
+        python_callable=annotated_vcf_tsv_present_branch_func,
+        dag=dag,
+    )
+
+    annotated_vcf_tsv_present = EmptyOperator(
+        task_id="annotated_vcf_tsv_present", dag=dag
+    )
+
+    annotated_vcf_tsv_not_present = EmptyOperator(
+        task_id="annotated_vcf_tsv_not_present", dag=dag
+    )
+
+    # Start annotation instance
+    start_annotation_instance = ComputeEngineInsertInstanceOperator(
+        task_id="start_annotation_instance",
+        trigger_rule="none_failed_min_one_success",
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        body={
+            "name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='annotation_instance_name') }}",
+            "machine_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='annotation_machine_type') }}",
+            "disks": [
+                {
+                    "boot": True,
+                    "auto_delete": True,
+                    "device_name": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='annotation_instance_name') }}",
+                    "initialize_params": {
+                        "disk_size_gb": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_size_gb') | int }}",
+                        "disk_type": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='disk_type') }}",
+                        "source_image": "projects/debian-cloud/global/images/family/debian-12",
+                    },
+                }
+            ],
+            "metadata": {
+                "items": [
+                    {
+                        "key": "startup-script",
+                        "value": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='annotation_startup_script') }}",
+                    }
+                ]
+            },
+            "network_interfaces": [
+                {
+                    "network": "global/networks/default",
+                    "subnetwork": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='subnetwork') }}",
+                    "nic_type": "GVNIC",
+                    "stack_type": "IPV4_ONLY",
+                    "access_configs": [
+                        {"name": "External NAT", "network_tier": "PREMIUM"}
+                    ],
+                }
+            ],
+            "service_accounts": [
+                {
+                    "email": "{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='sa_email') }}",
+                    "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                }
+            ],
+        },
+        dag=dag,
+    )
+
+    # Wait for annotated VCF files
+    wait_for_annotated_vcfs = GCSObjectExistenceSensor(
+        task_id="wait_for_annotated_vcfs",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_prefix') }}_snpeff.ann.vcf.gz",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=7200,  # 2 hours
+        poke_interval=30,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Wait for annotated TSV file
+    wait_for_annotated_tsv_file = GCSObjectExistenceSensor(
+        task_id="wait_for_annotated_tsv_file",
+        bucket="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='genome_results_bucket') }}",
+        object="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='results_vcf_object_prefix') }}_snpeff.ann.tsv.gz",
+        google_cloud_conn_id="google_cloud_default",
+        timeout=7200,  # 2 hours
+        poke_interval=30,
+        mode="poke",
+        dag=dag,
+    )
+
+    # Terminate annotation instance
+    terminate_annotation_instance = ComputeEngineDeleteInstanceOperator(
+        task_id="terminate_annotation_instance",
+        project_id=PROJECT_ID,
+        zone=ZONE,
+        resource_id="{{ task_instance.xcom_pull(task_ids='prepare_genomic_analysis', key='annotation_instance_name') }}",
+        dag=dag,
+    )
+    (
+        check_for_reference_genome
+        >> check_reference_genome_branch
+        >> [
+            check_for_annotated_vcf_tsv_files,
+            skip_annotation,
+        ]
+    )
+    (
+        check_for_annotated_vcf_tsv_files
+        >> annotated_vcf_tsv_present_branch
+        >> [annotated_vcf_tsv_present, annotated_vcf_tsv_not_present]
+    )
+    (
+        annotated_vcf_tsv_not_present
+        >> start_annotation_instance
+        >> wait_for_annotated_vcfs
+        >> wait_for_annotated_tsv_file
+        >> terminate_annotation_instance
+    )
+
 # Define DAG task dependencies
-prepare_genomic_analysis >> alignment_tasks >> variant_calling_tasks
+prepare_genomic_analysis >> alignment_tasks >> variant_calling_tasks >> annotation_tasks
