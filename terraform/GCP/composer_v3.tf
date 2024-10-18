@@ -34,7 +34,7 @@ resource "google_composer_environment" "genomics_composer_v3" {
         memory_gb  = 4
         storage_gb = 10
         min_count  = 1
-        max_count  = 2
+        max_count  = 10
       }
     }
   }

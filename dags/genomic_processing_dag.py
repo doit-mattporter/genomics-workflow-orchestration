@@ -402,14 +402,14 @@ wait
         key="annotation_instance_name", value=annotation_instance_name
     )
     context["task_instance"].xcom_push(
-        key="alignment_machine_type", value=f"zones/{ZONE}/machineTypes/c3-standard-88"
+        key="alignment_machine_type", value=f"zones/{ZONE}/machineTypes/c4-standard-96"
     )
     context["task_instance"].xcom_push(
         key="variant_calling_machine_type",
-        value=f"zones/{ZONE}/machineTypes/c3-standard-8",
+        value=f"zones/{ZONE}/machineTypes/c4-standard-8",
     )
     context["task_instance"].xcom_push(
-        key="annotation_machine_type", value=f"zones/{ZONE}/machineTypes/c3-standard-8"
+        key="annotation_machine_type", value=f"zones/{ZONE}/machineTypes/c4-standard-8"
     )
     context["task_instance"].xcom_push(
         key="subnetwork", value=f"regions/{REGION}/subnetworks/default"
